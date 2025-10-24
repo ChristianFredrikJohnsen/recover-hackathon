@@ -17,7 +17,6 @@ dependencies = [
     "pyodbc>=5.2.0,<6.0.0",
     "polars>=1.33.0,<2.0.0",
     "torchvision<0.23",
-    "scikit-learn<1.4.1",
     "kaggle>=1.7.4.5",
     "pyarrow>=21.0.0",
 ]
