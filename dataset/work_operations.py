@@ -49,11 +49,13 @@ class WorkOperationsDataset(BaseDataset):
         np_rng: np.random.Generator | None = None,
         py_rng: random.Random | None = None,
         num_clusters: int = 388,
+        fraction: float = 1.0,
     ):
         super().__init__(root)
         self.split = split
         self.seed = seed
         self.num_clusters = num_clusters
+        self.fraction = fraction
 
         self.np_rng = np_rng if np_rng is not None else np.random.default_rng(seed)
         self.py_rng = py_rng if py_rng is not None else random.Random(seed)
@@ -161,6 +163,16 @@ class WorkOperationsDataset(BaseDataset):
 
     def _load_data(self):
         lf = pl.scan_csv(os.path.join(self.data_folder, f"{self.split}.csv"))
+        
+        # Apply fraction sampling to reduce dataset size
+        if self.fraction < 1.0:
+            # First collect to get unique project_ids, then filter
+            temp_data = lf.select("project_id").collect()
+            unique_projects = temp_data["project_id"].unique()
+            n_projects = int(len(unique_projects) * self.fraction)
+            sampled_projects = unique_projects.sample(n=n_projects, seed=self.seed, shuffle=True)
+            lf = lf.filter(pl.col("project_id").is_in(sampled_projects))
+        
         data = (
             lf.with_columns(
                 pl.col("room").map_elements(self._cluster_room, return_dtype=pl.Utf8).alias("room_cluster"),

@@ -22,6 +22,7 @@ class HackathonDataset(Dataset):
         root: str = "data",
         num_companies: int = 14,
         seed: int | None = None,
+        fraction: float = 1.0,
     ):
         np_rng = np.random.default_rng(seed)
         py_rng = random.Random(seed)
@@ -48,6 +49,7 @@ class HackathonDataset(Dataset):
             ],
             np_rng=np_rng,
             py_rng=py_rng,
+            fraction=fraction,
         )
         self.metadata_dataset = MetadataDataset(
             root=root,
