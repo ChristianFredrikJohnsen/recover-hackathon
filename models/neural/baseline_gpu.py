@@ -125,8 +125,8 @@ class OperationDataset(Dataset):
 
         return {
             'room_idx': room_idx,
-            'features': torch.from_numpy(features),
-            'target': torch.from_numpy(target_vec),
+            'features': torch.from_numpy(features).float(),  # Ensure float32
+            'target': torch.from_numpy(target_vec).float(),  # Ensure float32
             'project_id': data['project_id'],
         }
 
