@@ -1,6 +1,6 @@
 """
 GPU-Accelerated Neural Network Model for Work Operations Prediction
-Uses pandas dataframe representation and PyTorch for training
+Uses the full HackathonDataset with all features including context rooms
 """
 
 import os
@@ -10,8 +10,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import LabelEncoder
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
@@ -24,134 +23,162 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {DEVICE}")
 
 # ============================================================================
-# 1. Data Preprocessing
+# 1. Custom Collate Function
 # ============================================================================
 
-class OperationDataset(Dataset):
-    """PyTorch dataset for room operations"""
+def collate_fn(batch):
+    """
+    Custom collate function to handle variable-length context rooms
+    """
+    # Stack fixed-size tensors
+    ids = torch.tensor([item['id'] for item in batch], dtype=torch.long)
+    X = torch.stack([item['X'].float() for item in batch])  # visible operations (388,)
+    Y = torch.stack([item['Y'].float() for item in batch])  # hidden operations (388,)
+    room_cluster_one_hot = torch.stack([item['room_cluster_one_hot'].float() for item in batch])  # (11,)
 
-    def __init__(self, df, num_operations=388, is_test=False):
+    # Handle insurance company one-hot (shape can be (1, 14) or (14,))
+    insurance_one_hots = []
+    for item in batch:
+        ins = item['insurance_company_one_hot'].float()
+        if ins.ndim == 2:
+            ins = ins.squeeze(0)  # (1, 14) -> (14,)
+        insurance_one_hots.append(ins)
+    insurance_company_one_hot = torch.stack(insurance_one_hots)  # (batch, 14)
+
+    # Metadata features
+    office_distance = torch.tensor([item['office_distance'] for item in batch], dtype=torch.float32)
+    case_creation_year = torch.tensor([item['case_creation_year'] for item in batch], dtype=torch.float32)
+    case_creation_month = torch.tensor([item['case_creation_month'] for item in batch], dtype=torch.float32)
+
+    # Context rooms (variable length) - we'll encode them
+    max_context_rooms = max(len(item['calculus']) for item in batch)
+
+    if max_context_rooms > 0:
+        # Create padded context tensor
+        context_ops = torch.zeros(len(batch), max_context_rooms, 388, dtype=torch.float32)
+        context_room_types = torch.zeros(len(batch), max_context_rooms, 11, dtype=torch.float32)
+        context_mask = torch.zeros(len(batch), max_context_rooms, dtype=torch.bool)
+
+        for i, item in enumerate(batch):
+            for j, ctx in enumerate(item['calculus']):
+                context_ops[i, j] = ctx['work_operations_index_encoded'].float()
+                context_room_types[i, j] = ctx['room_cluster_one_hot'].float()
+                context_mask[i, j] = True
+    else:
+        context_ops = torch.zeros(len(batch), 0, 388, dtype=torch.float32)
+        context_room_types = torch.zeros(len(batch), 0, 11, dtype=torch.float32)
+        context_mask = torch.zeros(len(batch), 0, dtype=torch.bool)
+
+    return {
+        'id': ids,
+        'X': X,
+        'Y': Y,
+        'room_cluster_one_hot': room_cluster_one_hot,
+        'insurance_company_one_hot': insurance_company_one_hot,
+        'office_distance': office_distance,
+        'case_creation_year': case_creation_year,
+        'case_creation_month': case_creation_month,
+        'context_ops': context_ops,
+        'context_room_types': context_room_types,
+        'context_mask': context_mask,
+    }
+
+
+# ============================================================================
+# 2. Neural Network Architecture with Context Attention
+# ============================================================================
+
+class ContextAggregator(nn.Module):
+    """Aggregates context room information using attention mechanism"""
+
+    def __init__(self, op_dim=388, room_dim=11, hidden_dim=128):
+        super(ContextAggregator, self).__init__()
+
+        # Encode each context room
+        self.context_encoder = nn.Sequential(
+            nn.Linear(op_dim + room_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        # Attention mechanism
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.Tanh(),
+            nn.Linear(64, 1),
+        )
+
+    def forward(self, context_ops, context_room_types, context_mask):
         """
         Args:
-            df: pandas dataframe from get_pandas_dataframe()
-            num_operations: total number of work operations (388)
-            is_test: if True, all operations are visible (no hidden)
+            context_ops: (batch, n_context, 388)
+            context_room_types: (batch, n_context, 11)
+            context_mask: (batch, n_context) - True where context exists
+        Returns:
+            aggregated_context: (batch, hidden_dim)
         """
-        self.num_operations = num_operations
-        self.is_test = is_test
+        batch_size, n_context, _ = context_ops.shape
 
-        # Group by room (index)
-        self.room_indices = df['index'].unique()
+        if n_context == 0:
+            # No context, return zeros
+            return torch.zeros(batch_size, 128, device=context_ops.device)
 
-        # Create room -> operations mapping
-        self.room_data = {}
-        for room_idx in self.room_indices:
-            room_df = df[df['index'] == room_idx]
+        # Concatenate operations and room types
+        context_features = torch.cat([context_ops, context_room_types], dim=-1)  # (batch, n_context, 399)
 
-            # Get visible operations
-            visible_ops = room_df[~room_df['is_hidden']]['work_operation'].values
+        # Encode each context room
+        context_encoded = self.context_encoder(context_features)  # (batch, n_context, hidden_dim)
 
-            # Get hidden operations (target)
-            hidden_ops = room_df[room_df['is_hidden']]['work_operation'].values
+        # Compute attention weights
+        attention_scores = self.attention(context_encoded).squeeze(-1)  # (batch, n_context)
 
-            # Get metadata (take first row since it's the same for all operations in a room)
-            row = room_df.iloc[0]
+        # Mask out padding
+        attention_scores = attention_scores.masked_fill(~context_mask, float('-inf'))
+        attention_weights = torch.softmax(attention_scores, dim=-1)  # (batch, n_context)
 
-            # Parse insurance company one-hot (it's already a list in pandas)
-            insurance_one_hot = row['insurance_company_one_hot']
-            if isinstance(insurance_one_hot, str):
-                insurance_one_hot = eval(insurance_one_hot)
-            elif not isinstance(insurance_one_hot, (list, np.ndarray)):
-                # If it's some other type, try to convert
-                insurance_one_hot = list(insurance_one_hot)
+        # Handle case where all context is masked (shouldn't happen, but for safety)
+        attention_weights = torch.nan_to_num(attention_weights, nan=0.0)
 
-            self.room_data[room_idx] = {
-                'visible_ops': visible_ops,
-                'hidden_ops': hidden_ops,
-                'room_cluster': row['room_cluster'],
-                'insurance_one_hot': insurance_one_hot,
-                'year': row['case_creation_year'],
-                'month': int(row['case_creation_month']),
-                'office_distance': row['office_distance'],
-                'project_id': row['project_id'],
-            }
+        # Weighted sum
+        aggregated = torch.bmm(attention_weights.unsqueeze(1), context_encoded).squeeze(1)  # (batch, hidden_dim)
 
-        # Encode room clusters
-        self.room_clusters = sorted(df['room_cluster'].unique())
-        self.room_cluster_to_idx = {cluster: idx for idx, cluster in enumerate(self.room_clusters)}
+        return aggregated
 
-        print(f"Loaded {len(self.room_indices)} rooms")
-        print(f"Room clusters: {self.room_clusters}")
-
-    def __len__(self):
-        return len(self.room_indices)
-
-    def __getitem__(self, idx):
-        room_idx = self.room_indices[idx]
-        data = self.room_data[room_idx]
-
-        # Create visible operations one-hot vector
-        visible_vec = np.zeros(self.num_operations, dtype=np.float32)
-        visible_vec[data['visible_ops']] = 1.0
-
-        # Create target (hidden operations) one-hot vector
-        target_vec = np.zeros(self.num_operations, dtype=np.float32)
-        if not self.is_test:
-            target_vec[data['hidden_ops']] = 1.0
-
-        # Create room cluster one-hot
-        room_cluster_vec = np.zeros(len(self.room_clusters), dtype=np.float32)
-        room_cluster_vec[self.room_cluster_to_idx[data['room_cluster']]] = 1.0
-
-        # Insurance company one-hot
-        insurance_vec = np.array(data['insurance_one_hot'], dtype=np.float32)
-
-        # Normalize year to [0, 1] range (2016-2025)
-        year_normalized = (data['year'] - 2016) / 9.0
-
-        # Normalize month to [0, 1] range
-        month_normalized = (data['month'] - 1) / 11.0
-
-        # Normalize office distance (log scale + normalization)
-        distance_normalized = np.log1p(data['office_distance']) / np.log1p(922.4)  # max distance
-
-        # Concatenate all features
-        features = np.concatenate([
-            visible_vec,  # 388 dims
-            room_cluster_vec,  # 12 dims
-            insurance_vec,  # 14 dims
-            [year_normalized, month_normalized, distance_normalized]  # 3 dims
-        ])
-
-        return {
-            'room_idx': room_idx,
-            'features': torch.from_numpy(features).float(),  # Ensure float32
-            'target': torch.from_numpy(target_vec).float(),  # Ensure float32
-            'project_id': data['project_id'],
-        }
-
-
-# ============================================================================
-# 2. Neural Network Architecture
-# ============================================================================
 
 class WorkOperationPredictor(nn.Module):
-    """Neural network for predicting hidden work operations"""
+    """Neural network for predicting hidden work operations with context"""
 
-    def __init__(self, input_dim=417, hidden_dims=[512, 256, 128], output_dim=388, dropout=0.3):
+    def __init__(self, use_context=True, hidden_dims=[512, 256, 128], output_dim=388, dropout=0.3):
         """
         Args:
-            input_dim: total input features (388 ops + 12 room + 14 insurance + 3 metadata)
+            use_context: whether to use context rooms
             hidden_dims: list of hidden layer dimensions
             output_dim: number of operations to predict (388)
             dropout: dropout rate
         """
         super(WorkOperationPredictor, self).__init__()
 
+        self.use_context = use_context
+
+        # Context aggregator
+        if use_context:
+            self.context_aggregator = ContextAggregator(op_dim=388, room_dim=11, hidden_dim=128)
+            context_dim = 128
+        else:
+            context_dim = 0
+
+        # Input features:
+        # - Visible operations: 388
+        # - Room cluster one-hot: 11
+        # - Insurance company one-hot: 14
+        # - Metadata (year, month, distance): 3
+        # - Context aggregation: 128 (if use_context)
+        input_dim = 388 + 11 + 14 + 3 + context_dim
+
+        # Build main network
         layers = []
         prev_dim = input_dim
 
-        # Build hidden layers
         for hidden_dim in hidden_dims:
             layers.append(nn.Linear(prev_dim, hidden_dim))
             layers.append(nn.BatchNorm1d(hidden_dim))
@@ -164,8 +191,48 @@ class WorkOperationPredictor(nn.Module):
 
         self.network = nn.Sequential(*layers)
 
-    def forward(self, x):
-        return self.network(x)
+    def forward(self, X, room_cluster_one_hot, insurance_company_one_hot,
+                year, month, distance, context_ops=None, context_room_types=None, context_mask=None):
+        """
+        Args:
+            X: visible operations (batch, 388)
+            room_cluster_one_hot: (batch, 11)
+            insurance_company_one_hot: (batch, 14)
+            year: (batch,)
+            month: (batch,)
+            distance: (batch,)
+            context_ops: (batch, n_context, 388) - optional
+            context_room_types: (batch, n_context, 11) - optional
+            context_mask: (batch, n_context) - optional
+        Returns:
+            output: (batch, 388)
+        """
+        batch_size = X.shape[0]
+
+        # Normalize metadata
+        year_norm = (year - 2016) / 9.0  # 2016-2025 -> [0, 1]
+        month_norm = (month - 1) / 11.0  # 1-12 -> [0, 1]
+        distance_norm = torch.log1p(distance) / torch.log1p(torch.tensor(922.4))  # log normalization
+
+        metadata = torch.stack([year_norm, month_norm, distance_norm], dim=1)  # (batch, 3)
+
+        # Concatenate base features
+        features = torch.cat([
+            X,
+            room_cluster_one_hot,
+            insurance_company_one_hot,
+            metadata,
+        ], dim=1)
+
+        # Add context if available
+        if self.use_context and context_ops is not None:
+            context_agg = self.context_aggregator(context_ops, context_room_types, context_mask)
+            features = torch.cat([features, context_agg], dim=1)
+
+        # Forward through network
+        output = self.network(features)
+
+        return output
 
 
 # ============================================================================
@@ -184,13 +251,23 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         train_loss = 0.0
 
         for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Training"):
-            features = batch['features'].to(device)
-            target = batch['target'].to(device)
+            # Move batch to device
+            X = batch['X'].to(device)
+            Y = batch['Y'].to(device)
+            room_cluster = batch['room_cluster_one_hot'].to(device)
+            insurance = batch['insurance_company_one_hot'].to(device)
+            year = batch['case_creation_year'].to(device)
+            month = batch['case_creation_month'].to(device)
+            distance = batch['office_distance'].to(device)
+            context_ops = batch['context_ops'].to(device)
+            context_room_types = batch['context_room_types'].to(device)
+            context_mask = batch['context_mask'].to(device)
 
             # Forward pass
             optimizer.zero_grad()
-            output = model(features)
-            loss = criterion(output, target)
+            output = model(X, room_cluster, insurance, year, month, distance,
+                          context_ops, context_room_types, context_mask)
+            loss = criterion(output, Y)
 
             # Backward pass
             loss.backward()
@@ -206,11 +283,20 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
 
         with torch.no_grad():
             for batch in val_loader:
-                features = batch['features'].to(device)
-                target = batch['target'].to(device)
+                X = batch['X'].to(device)
+                Y = batch['Y'].to(device)
+                room_cluster = batch['room_cluster_one_hot'].to(device)
+                insurance = batch['insurance_company_one_hot'].to(device)
+                year = batch['case_creation_year'].to(device)
+                month = batch['case_creation_month'].to(device)
+                distance = batch['office_distance'].to(device)
+                context_ops = batch['context_ops'].to(device)
+                context_room_types = batch['context_room_types'].to(device)
+                context_mask = batch['context_mask'].to(device)
 
-                output = model(features)
-                loss = criterion(output, target)
+                output = model(X, room_cluster, insurance, year, month, distance,
+                              context_ops, context_room_types, context_mask)
+                loss = criterion(output, Y)
                 val_loss += loss.item()
 
         avg_val_loss = val_loss / len(val_loader)
@@ -242,48 +328,53 @@ def predict_operations(model, dataloader, threshold=0.5, device=DEVICE):
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Generating predictions"):
-            features = batch['features'].to(device)
-            room_indices = batch['room_idx'].numpy()
+            X = batch['X'].to(device)
+            room_cluster = batch['room_cluster_one_hot'].to(device)
+            insurance = batch['insurance_company_one_hot'].to(device)
+            year = batch['case_creation_year'].to(device)
+            month = batch['case_creation_month'].to(device)
+            distance = batch['office_distance'].to(device)
+            context_ops = batch['context_ops'].to(device)
+            context_room_types = batch['context_room_types'].to(device)
+            context_mask = batch['context_mask'].to(device)
+            ids = batch['id'].cpu().numpy()
 
             # Forward pass
-            output = model(features)
+            output = model(X, room_cluster, insurance, year, month, distance,
+                          context_ops, context_room_types, context_mask)
             probs = torch.sigmoid(output)
 
-            # Apply threshold to get binary predictions
+            # Apply threshold
             pred_ops = (probs > threshold).cpu().numpy()
 
             # Store predictions
-            for i, room_idx in enumerate(room_indices):
+            for i, room_id in enumerate(ids):
                 predicted_codes = np.where(pred_ops[i])[0].tolist()
-                predictions[int(room_idx)] = predicted_codes
+                predictions[int(room_id)] = predicted_codes
 
     return predictions
 
 
-def evaluate_predictions(predictions, val_dataset_hackathon):
+def evaluate_predictions(predictions, val_dataset):
     """Evaluate predictions using the normalized rooms score"""
-
-    # Get ground truth from validation dataset
-    val_df = val_dataset_hackathon.get_pandas_dataframe()
 
     y_true = []
     y_pred = []
 
-    for room_idx in sorted(predictions.keys()):
-        # Get ground truth hidden operations for this room
-        room_df = val_df[val_df['index'] == room_idx]
-        true_hidden = room_df[room_df['is_hidden']]['work_operation'].values.tolist()
+    # Build ground truth from dataset
+    for idx in range(len(val_dataset)):
+        sample = val_dataset[idx]
+        room_id = sample['id']
 
-        # Get visible operations (needed for scoring function)
-        visible = room_df[~room_df['is_hidden']]['work_operation'].values.tolist()
+        if room_id not in predictions:
+            continue
 
-        # Create one-hot vectors
-        true_vec = [0] * 388
-        for op in true_hidden:
-            true_vec[op] = 1
+        # Ground truth
+        true_vec = sample['Y'].numpy().astype(int).tolist()
 
+        # Prediction
         pred_vec = [0] * 388
-        for op in predictions[room_idx]:
+        for op in predictions[room_id]:
             pred_vec[op] = 1
 
         y_true.append(true_vec)
@@ -299,42 +390,34 @@ def evaluate_predictions(predictions, val_dataset_hackathon):
 
 def main():
     print("="*80)
-    print("GPU-ACCELERATED NEURAL NETWORK MODEL")
+    print("GPU-ACCELERATED NEURAL NETWORK MODEL WITH CONTEXT")
     print("="*80)
 
     # Load datasets
     print("\n--- Loading datasets ---")
-    train_dataset_hackathon = HackathonDataset(split="train", download=False, seed=42, root="data", fraction=0.3)
-    val_dataset_hackathon = HackathonDataset(split="val", download=False, seed=42, root="data")
-    test_dataset_hackathon = HackathonDataset(split="test", download=False, seed=42, root="data")
+    train_dataset = HackathonDataset(split="train", download=False, seed=42, root="data", fraction=0.4)
+    val_dataset = HackathonDataset(split="val", download=False, seed=42, root="data")
+    test_dataset = HackathonDataset(split="test", download=False, seed=42, root="data")
 
-    # Convert to pandas
-    print("\n--- Converting to pandas ---")
-    train_df = train_dataset_hackathon.get_pandas_dataframe()
-    val_df = val_dataset_hackathon.get_pandas_dataframe()
-    test_df = test_dataset_hackathon.get_pandas_dataframe()
-
-    print(f"Train: {train_df.shape}, Val: {val_df.shape}, Test: {test_df.shape}")
-
-    # Create PyTorch datasets
-    print("\n--- Creating PyTorch datasets ---")
-    train_dataset = OperationDataset(train_df, num_operations=388, is_test=False)
-    val_dataset = OperationDataset(val_df, num_operations=388, is_test=False)
-    test_dataset = OperationDataset(test_df, num_operations=388, is_test=True)
+    print(f"Train dataset: {len(train_dataset)} rooms")
+    print(f"Val dataset: {len(val_dataset)} rooms")
+    print(f"Test dataset: {len(test_dataset)} rooms")
 
     # Create dataloaders
-    batch_size = 128
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    batch_size = 64
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                              collate_fn=collate_fn, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                           collate_fn=collate_fn, num_workers=4)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
+                            collate_fn=collate_fn, num_workers=4)
 
     print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}, Test batches: {len(test_loader)}")
 
     # Initialize model
     print("\n--- Initializing model ---")
-    input_dim = 388 + 12 + 14 + 3  # operations + room clusters + insurance + metadata
     model = WorkOperationPredictor(
-        input_dim=input_dim,
+        use_context=True,
         hidden_dims=[512, 256, 128],
         output_dim=388,
         dropout=0.3
@@ -344,7 +427,7 @@ def main():
     print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Loss and optimizer
-    criterion = nn.BCEWithLogitsLoss()  # Binary cross-entropy with logits
+    criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
 
     # Train model
@@ -363,9 +446,8 @@ def main():
     print("\n--- Evaluating on validation set ---")
     val_predictions = predict_operations(model, val_loader, threshold=0.5, device=DEVICE)
 
-    # Calculate custom score
     print("\n--- Calculating validation score ---")
-    val_score = evaluate_predictions(val_predictions, val_dataset_hackathon)
+    val_score = evaluate_predictions(val_predictions, val_dataset)
     print(f"Validation Score: {val_score:.4f}")
 
     # Statistics
@@ -382,7 +464,7 @@ def main():
     # Create submission
     print("\n--- Creating submission ---")
     os.makedirs("submissions", exist_ok=True)
-    test_dataset_hackathon.create_submission(test_predictions)
+    test_dataset.create_submission(test_predictions)
 
     print("\n" + "="*80)
     print("TRAINING COMPLETE!")
