@@ -57,8 +57,13 @@ class OperationDataset(Dataset):
             # Get metadata (take first row since it's the same for all operations in a room)
             row = room_df.iloc[0]
 
-            # Parse insurance company one-hot (it's stored as string representation of list)
-            insurance_one_hot = eval(row['insurance_company_one_hot'])
+            # Parse insurance company one-hot (it's already a list in pandas)
+            insurance_one_hot = row['insurance_company_one_hot']
+            if isinstance(insurance_one_hot, str):
+                insurance_one_hot = eval(insurance_one_hot)
+            elif not isinstance(insurance_one_hot, (list, np.ndarray)):
+                # If it's some other type, try to convert
+                insurance_one_hot = list(insurance_one_hot)
 
             self.room_data[room_idx] = {
                 'visible_ops': visible_ops,
